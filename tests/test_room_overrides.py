@@ -12,6 +12,7 @@ Covers:
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.robovac_mqtt.config_flow import (
     _format_rooms_text,
@@ -32,7 +33,7 @@ def test_parse_rooms_tolerates_whitespace_blanks_comments():
     assert _parse_rooms_text(text) == {1: "Lounge with space", 5: "Kitchen"}
 
 
-def test_parse_rooms_skips_unparseable_lines():
+def test_parse_rooms_skips_unparsable_lines():
     text = "1: Lounge\nnot a line\n3: \n: missing id\nfour: bad"
     assert _parse_rooms_text(text) == {1: "Lounge"}
 
@@ -81,13 +82,13 @@ def test_options_uses_overrides_when_set():
     c = _coord(room_overrides={5: "Kitchen", 1: "Lounge"})
     ent = RoomSelectEntity(c)
     # "None" placeholder first, then rooms sorted by id with disambiguating labels.
-    assert ent.options == ["None", "Lounge (ID: 1)", "Kitchen (ID: 5)"]
+    assert ent.options == ["None", "Lounge", "Kitchen"]
 
 
 def test_options_falls_back_to_p2p_when_no_overrides():
     c = _coord(p2p_rooms=[{"id": 1, "name": "DeviceLounge"}, {"id": 2, "name": "DeviceKitchen"}])
     ent = RoomSelectEntity(c)
-    assert ent.options == ["None", "DeviceLounge (ID: 1)", "DeviceKitchen (ID: 2)"]
+    assert ent.options == ["None", "DeviceLounge", "DeviceKitchen"]
 
 
 def test_overrides_take_priority_over_p2p():
@@ -96,7 +97,7 @@ def test_overrides_take_priority_over_p2p():
         p2p_rooms=[{"id": 1, "name": "DeviceLounge"}, {"id": 2, "name": "DeviceKitchen"}],
     )
     ent = RoomSelectEntity(c)
-    assert ent.options == ["None", "MyKitchen (ID: 5)"]
+    assert ent.options == ["None", "MyKitchen"]
 
 
 def test_options_empty_when_neither_source():
@@ -111,7 +112,7 @@ async def test_select_option_sends_room_clean_with_override_id():
     c = _coord(room_overrides={5: "Kitchen", 1: "Lounge"})
     ent = RoomSelectEntity(c)
     ent.async_write_ha_state = MagicMock()
-    await ent.async_select_option("Kitchen (ID: 5)")
+    await ent.async_select_option("Kitchen")
     c.build_device_command.assert_called_once_with(
         "room_clean", room_ids=[5], map_id=3
     )
@@ -119,11 +120,13 @@ async def test_select_option_sends_room_clean_with_override_id():
 
 
 @pytest.mark.asyncio
-async def test_select_option_unknown_room_logs_and_returns():
+async def test_select_option_unknown_room_raises_and_sends_nothing():
+    """An unknown room is a user error: the action fails instead of passing silently."""
     c = _coord(room_overrides={5: "Kitchen"})
     ent = RoomSelectEntity(c)
     ent.async_write_ha_state = MagicMock()
-    await ent.async_select_option("Nonexistent")
+    with pytest.raises(ServiceValidationError):
+        await ent.async_select_option("Nonexistent")
     c.build_device_command.assert_not_called()
     c.async_send_command.assert_not_awaited()
 

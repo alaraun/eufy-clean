@@ -20,9 +20,20 @@ _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 _LOGGER = logging.getLogger(__name__)
 
-# Login endpoints tried in order: the new unified "Eufy" app (v2) first, then
-# the legacy "Eufy Clean" app (v1). Accounts migrated to the unified app no
-# longer authenticate against the v1 endpoint, so v2 must be attempted first.
+
+class EufyLoginTransientError(Exception):
+    """The login could not be decided: rate limit, server error or network.
+
+    Not a credential rejection; the caller retries later and keeps its tokens.
+    """
+
+
+def _is_transient_status(status: int) -> bool:
+    """HTTP statuses that say nothing about the credentials."""
+    return status in (408, 429) or status >= 500
+
+
+# Tried in order; accounts on the unified Eufy app reject the legacy config.
 _LOGIN_CONFIGS: list[dict[str, str]] = [
     {
         "label": "v2 (Eufy app)",
@@ -57,35 +68,53 @@ class EufyHTTPClient:
         self._websession = websession
         self.session: dict[str, Any] | None = None
         self.user_info: dict[str, Any] | None = None
+        # _LOGIN_CONFIGS entry that last worked; probing starts there.
+        self.login_label: str | None = None
+        # The device-list getters collapse every non-200 to [], so only this
+        # flag tells a dead token from an account with no such devices.
+        self.auth_error: bool = False
 
     async def login(self, validate_only: bool = False) -> dict[str, Any]:
-        """Log in, preferring a credential set whose token yields a user_center id.
+        """Log in, preferring a token that yields a user_center id.
 
-        AIOT/MQTT discovery (get_device_list, get_mqtt_credentials) needs a
-        ``user_center_token``, which some accounts — notably ones migrated to the
-        new unified Eufy app — only obtain from the v2 ``eufy-app`` login; the v1
-        token authenticates but returns no user_center (issues #121/#124/#131).
-        So rather than use the FIRST login that returns an access_token, try each
-        and prefer one whose token actually yields a ``user_center_id``. Fall
-        back to any working token — the Tuya cloud path only needs the eufy
-        ``user_id``.
+        AIOT/MQTT discovery needs a ``user_center_token``, which some accounts
+        only get from the v2 login, so try every config rather than take the
+        first access_token. A token without one is kept as a fallback for the
+        Tuya path, which needs only the eufy ``user_id``.
+
+        Returns {} when every config rejected the credentials. Raises
+        EufyLoginTransientError when a config could not be decided (429, 5xx,
+        unreadable body, network error) and none yielded a user_center token.
         """
         fallback_session: dict[str, Any] | None = None
-        for config in _LOGIN_CONFIGS:
-            session = await self._attempt_login(config)
+        transient: BaseException | None = None
+        for config in self._ordered_login_configs():
+            try:
+                session = await self._attempt_login(config)
+            except (EufyLoginTransientError, aiohttp.ClientError, TimeoutError) as err:
+                _LOGGER.debug("Login via %s undecided: %s", config["label"], err)
+                transient = err
+                continue
             if not session:
                 continue
             self.session = session
             if validate_only:
                 _LOGGER.info("Login (validate) successful via %s", config["label"])
+                self.login_label = config["label"]
                 return {"session": session}
 
-            user = await self.get_user_info()  # sets self.user_info
+            try:
+                user = await self.get_user_info()  # sets self.user_info
+            except (EufyLoginTransientError, aiohttp.ClientError, TimeoutError) as err:
+                _LOGGER.debug("User info via %s undecided: %s", config["label"], err)
+                transient = err
+                continue
             if user and user.get("user_center_id"):
                 _LOGGER.info(
                     "Login successful via %s (user_center available)",
                     config["label"],
                 )
+                self.login_label = config["label"]
                 mqtt = await self.get_mqtt_credentials()
                 return {"session": session, "user": user, "mqtt": mqtt}
 
@@ -97,10 +126,14 @@ class EufyHTTPClient:
             if fallback_session is None:
                 fallback_session = session
 
+        # An undecided config may be the one that yields a user_center, so a
+        # fallback session or a rejection from the others is not conclusive.
+        if transient is not None:
+            raise EufyLoginTransientError(
+                f"Eufy login unavailable: {transient}"
+            ) from transient
+
         if fallback_session is not None:
-            # No login produced a user_center id (e.g. user_center_info returns
-            # 401 for this account). Use the fallback so the Tuya cloud/local
-            # path can still discover the device via the eufy user_id.
             _LOGGER.info(
                 "No user_center from any login; using fallback session "
                 "(Tuya cloud/local discovery only)"
@@ -109,13 +142,51 @@ class EufyHTTPClient:
             self.user_info = None
             return {"session": fallback_session, "user": None, "mqtt": None}
 
-        _LOGGER.error("All login attempts failed.")
+        _LOGGER.error("All login attempts were rejected")
         return {}
+
+    def _note_auth_status(self, status: int, where: str) -> None:
+        """Record a rejected authenticated call so the caller can re-login."""
+        if status in (401, 403):
+            self.auth_error = True
+            _LOGGER.debug("Eufy rejected the session on %s (HTTP %s)", where, status)
+
+    def _ordered_login_configs(self) -> list[dict[str, str]]:
+        """``_LOGIN_CONFIGS`` with a previously successful entry moved to front.
+
+        Reorders only, never filters: a memo that stopped working must still
+        fall through to the others.
+        """
+        if not self.login_label:
+            return list(_LOGIN_CONFIGS)
+        preferred = [c for c in _LOGIN_CONFIGS if c["label"] == self.login_label]
+        if not preferred:
+            return list(_LOGIN_CONFIGS)
+        return preferred + [c for c in _LOGIN_CONFIGS if c["label"] != self.login_label]
+
+    def restore(
+        self,
+        session: dict[str, Any] | None,
+        user_info: dict[str, Any] | None,
+        login_label: str | None = None,
+    ) -> None:
+        """Adopt a persisted session without contacting the cloud.
+
+        The caller decides whether it is still usable (``can_skip_login``).
+        """
+        self.session = session
+        self.user_info = user_info
+        self.login_label = login_label
+        self.auth_error = False
 
     async def _attempt_login(
         self, config: dict[str, str]
     ) -> dict[str, Any] | None:
-        """POST a single credential set; return the session JSON or None."""
+        """POST a single credential set; return the session JSON or None.
+
+        None means the server answered and rejected the credentials. Raises
+        EufyLoginTransientError for a transient status or an unreadable 200.
+        """
         _LOGGER.debug(
             "Attempting login via %s: %s", config["label"], config["url"]
         )
@@ -142,27 +213,47 @@ class EufyHTTPClient:
             response_json = None
             try:
                 response_json = await response.json()
-            except Exception:
+            except (aiohttp.ContentTypeError, ValueError):
                 pass
 
+            if _is_transient_status(response.status):
+                raise EufyLoginTransientError(
+                    f"{config['label']} login: HTTP {response.status}"
+                )
+            if response.status == 200 and not isinstance(response_json, dict):
+                raise EufyLoginTransientError(
+                    f"{config['label']} login: unreadable response body"
+                )
             if (
                 response.status == 200
-                and response_json
+                and isinstance(response_json, dict)
                 and response_json.get("access_token")
             ):
                 return response_json
 
-            body = response_json or await response.text()
+            # Only the status and the API's own error fields: the full body can
+            # echo account details back into the log.
+            if isinstance(response_json, dict):
+                detail = {
+                    k: response_json.get(k)
+                    for k in ("res_code", "code", "message", "msg")
+                    if k in response_json
+                }
+            else:
+                detail = None
             _LOGGER.debug(
                 "Login attempt failed for %s: %s %s",
                 config["label"],
                 response.status,
-                body,
+                detail,
             )
             return None
 
     async def get_user_info(self) -> dict[str, Any] | None:
-        """Get User details."""
+        """Get User details; None when the session has no user_center.
+
+        Raises EufyLoginTransientError on a transient HTTP status.
+        """
         if not self.session:
             return None
 
@@ -179,28 +270,32 @@ class EufyHTTPClient:
                 "clienttype": "2",
             },
         ) as response:
+            self._note_auth_status(response.status, "get_user_info")
+            if _is_transient_status(response.status):
+                raise EufyLoginTransientError(f"user info: HTTP {response.status}")
             if response.status == 200:
                 user_info = await response.json()
-                if user_info is None or not user_info.get("user_center_id"):
-                    _LOGGER.error("No user_center_id found")
+                # Expected for fallback-session accounts; login() handles it.
+                if not isinstance(user_info, dict) or not user_info.get("user_center_id"):
+                    _LOGGER.debug("No user_center_id in the user info")
                     self.user_info = None
                     return None
 
-                # Generate GToken
                 user_info["gtoken"] = hashlib.md5(
                     user_info["user_center_id"].encode()
                 ).hexdigest()
                 self.user_info = user_info
                 return self.user_info
 
-            _LOGGER.error("get user center info failed")
+            _LOGGER.debug("User info request failed: HTTP %s", response.status)
             self.user_info = None
             return None
 
     async def get_device_list(self) -> list[dict[str, Any]]:
         """Get list of devices."""
         if not self.user_info:
-            _LOGGER.error("Cannot get device list: user_info is None")
+            # Fallback-session accounts have no user_center and no AIOT list.
+            _LOGGER.debug("Skipping the AIOT device list: no user_center")
             return []
 
         session = self._websession
@@ -219,6 +314,7 @@ class EufyHTTPClient:
             },
             json={"attribute": 3},
         ) as response:
+            self._note_auth_status(response.status, "get_device_list")
             if response.status == 200:
                 data = await response.json()
                 devices = data.get("data", {}).get("devices")
@@ -233,7 +329,6 @@ class EufyHTTPClient:
             _LOGGER.error("Cannot get cloud device list: no session")
             return []
 
-        # Try the legacy api.eufylife.com endpoint first.
         devices = await self._get_cloud_device_list_legacy()
         if devices:
             _LOGGER.debug(
@@ -241,7 +336,6 @@ class EufyHTTPClient:
             )
             return devices
 
-        # Fallback: the home-api endpoint (unified Eufy app).
         devices = await self._get_home_device_list()
         if devices:
             _LOGGER.debug(
@@ -267,6 +361,7 @@ class EufyHTTPClient:
                 "clienttype": "2",
             },
         ) as response:
+            self._note_auth_status(response.status, "_get_cloud_device_list_legacy")
             if response.status == 200:
                 data = await response.json()
                 return data.get("devices", [])
@@ -286,6 +381,7 @@ class EufyHTTPClient:
                 "token": self.session["access_token"],  # type: ignore
             },
         ) as response:
+            self._note_auth_status(response.status, "_get_home_device_list")
             if response.status == 200:
                 data = await response.json()
                 _LOGGER.debug(
@@ -294,7 +390,7 @@ class EufyHTTPClient:
                     if isinstance(data, dict)
                     else type(data).__name__,
                 )
-                # The response format may vary; try known structures.
+                # Response shape varies; try the known structures.
                 if isinstance(data, dict):
                     devices = data.get("devices", data.get("data", []))
                     if isinstance(devices, dict):
@@ -308,7 +404,7 @@ class EufyHTTPClient:
             return []
 
     async def get_mqtt_credentials(self) -> dict[str, Any] | None:
-        """Get MQTT credentials."""
+        """Get MQTT credentials; raises EufyLoginTransientError on 429/5xx."""
         if not self.user_info:
             _LOGGER.error("Cannot get MQTT credentials: user_info is None")
             return None
@@ -328,6 +424,11 @@ class EufyHTTPClient:
                 "gtoken": self.user_info["gtoken"],
             },
         ) as response:
+            self._note_auth_status(response.status, "get_mqtt_credentials")
+            if _is_transient_status(response.status):
+                raise EufyLoginTransientError(
+                    f"MQTT credentials: HTTP {response.status}"
+                )
             if response.status == 200:
                 return (await response.json()).get("data")
             return None

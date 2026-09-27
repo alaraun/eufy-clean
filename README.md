@@ -195,12 +195,13 @@ unavailable just because the LAN address has shifted.
 > integration debug logs that might contain it into public issues.
 
 > [!NOTE]
-> Live map and live X/Y position are **not** available over either Tuya
-> transport — Eufy delivers them through a separate encrypted P2P channel
-> (`eufy_mega` SDK) that no public reverse-engineering has cracked yet.
-> Everything else — vacuum/mop mode, water level, clean count, spot/zone/room
-> commands, station status, consumables, lifetime stats, all sensors —
-> works fine over both transports.
+> The floor map and the live robot position do **not** travel over either Tuya
+> transport: no datapoint carries them. The map is downloaded from Tuya cloud
+> storage and the live position and cleaning trail arrive on a separate Tuya
+> channel, both of which need cloud access regardless of whether the LAN
+> transport is enabled. Everything else — vacuum/mop mode, water level, clean
+> count, spot/zone/room commands, station status, consumables, lifetime stats,
+> all sensors — works over both transports.
 
 ### Optional: Manual room name overrides
 
@@ -338,6 +339,15 @@ has cleaned once (or you've edited the map in the app).
 ---
 
 ## Development
+
+### Documentation
+
+| Document | Contents |
+|----------|----------|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | layers, transports, datapoint map, state model, entity platforms |
+| [`docs/MAP.md`](docs/MAP.md) | how the floor map, live pose and cleaning trail are obtained and drawn |
+| [`docs/MAP_WS_CONTRACT.md`](docs/MAP_WS_CONTRACT.md) | the map websocket wire format |
+| [`docs/CARD.md`](docs/CARD.md) | the bundled Lovelace card |
 
 ### Local Testing
 A `docker-compose.yml` is included for local development:

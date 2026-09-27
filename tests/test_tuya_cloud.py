@@ -316,6 +316,68 @@ async def test_login_handles_region_redirect():
     assert client.region == "AY"
 
 
+@pytest.mark.asyncio
+async def test_relogin_after_redirect_keeps_the_probed_country_code():
+    """A second login on the same client sends the probed countryCode, not
+    the redirect's regionCode, and keeps the device id."""
+    client = TuyaCloudClient("EU", websession=MagicMock())
+    device_id = client._device_id
+    sent: list[str] = []
+
+    async def mock_request(action, data=None, *, requires_sid=True, **kwargs):
+        assert data is not None
+        sent.append(data["countryCode"])
+        if "token.create" in action:
+            return {"publicKey": "00b3510a2e6c4fa1e339a0703e64444c", "exponent": "3", "token": "t"}
+        return {"sid": "s", "domain": {"mobileApiUrl": "https://a1.tuyacn.com", "regionCode": "AY"}}
+
+    with patch.object(client, "request", side_effect=mock_request):
+        await client.login("user_id_123")
+        await client.login("user_id_123")
+
+    assert sent == ["EU"] * 4
+    assert client._device_id == device_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token_result, login_result",
+    [
+        (None, None),
+        ({"publicKey": "ab"}, None),
+        ({"publicKey": "00b3510a2e6c4fa1", "exponent": "3", "token": "t"}, None),
+        ({"publicKey": "00b3510a2e6c4fa1", "exponent": "3", "token": "t"}, {"domain": {}}),
+    ],
+)
+async def test_login_malformed_answer_raises_tuya_error(token_result, login_result):
+    """A malformed login answer is a TuyaCloudError, so region probing goes on."""
+    client = TuyaCloudClient("EU", websession=MagicMock())
+
+    async def mock_request(action, data=None, *, requires_sid=True, **kwargs):
+        return token_result if "token.create" in action else login_result
+
+    with patch.object(client, "request", side_effect=mock_request):
+        with pytest.raises(TuyaCloudError):
+            await client.login("user_id_123")
+
+
+@pytest.mark.asyncio
+async def test_request_non_object_body_raises_tuya_error():
+    """A JSON body that is not an object is a TuyaCloudError, not AttributeError."""
+    resp = MagicMock()
+    resp.url = "https://a1.tuyaeu.com/api.json"
+    resp.json = AsyncMock(return_value=None)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=resp)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.get.return_value = ctx
+    client = TuyaCloudClient("EU", websession=session)
+
+    with pytest.raises(TuyaCloudError):
+        await client.request("tuya.m.location.list", requires_sid=False)
+
+
 # ── Cross-implementation signing (Python vs upstream JS) ──────────
 
 

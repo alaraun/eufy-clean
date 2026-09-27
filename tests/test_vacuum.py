@@ -6,12 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components.vacuum import VacuumActivity
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
-from custom_components.robovac_mqtt.const import (
-    EUFY_CLEAN_CLEAN_SPEED,
-    EUFY_CLEAN_VACUUMCLEANER_STATE,
-)
+from custom_components.robovac_mqtt.const import EUFY_CLEAN_CLEAN_SPEED
 from custom_components.robovac_mqtt.coordinator import EufyCleanCoordinator
 from custom_components.robovac_mqtt.models import VacuumState
 from custom_components.robovac_mqtt.vacuum import RoboVacMQTTEntity
@@ -48,10 +45,10 @@ def test_vacuum_properties(mock_coordinator, mock_config_entry):
     # assert entity.name is None  # has_entity_name is True
 
     # Test Activity Mapping
-    mock_coordinator.data.activity = EUFY_CLEAN_VACUUMCLEANER_STATE.CLEANING
+    mock_coordinator.data.activity = "cleaning"
     assert entity.activity == VacuumActivity.CLEANING
 
-    mock_coordinator.data.activity = EUFY_CLEAN_VACUUMCLEANER_STATE.DOCKED
+    mock_coordinator.data.activity = "docked"
     assert entity.activity == VacuumActivity.DOCKED
 
     mock_coordinator.data.activity = "error"
@@ -137,25 +134,31 @@ async def test_zone_clean_dispatch(mock_coordinator, mock_config_entry):
 
 
 @pytest.mark.asyncio
-async def test_zone_clean_no_rects_noop(mock_coordinator, mock_config_entry):
-    """zone_clean with an empty 'zones' list dispatches nothing."""
+async def test_zone_clean_no_rects_raises(mock_coordinator, mock_config_entry):
+    """zone_clean with an empty 'zones' list raises instead of silently no-op'ing.
+
+    A silent success on a command that never reached the device is the failure
+    mode this integration has been bitten by before, so the entity now surfaces it.
+    """
     entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
     mock_coordinator.normalized_rects_to_quads_cm = MagicMock(return_value=[])
 
-    await entity.async_send_command("zone_clean", {"zones": []})
+    with pytest.raises(HomeAssistantError, match="zone_clean"):
+        await entity.async_send_command("zone_clean", {"zones": []})
 
     mock_coordinator.async_send_command.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_zone_clean_no_map_noop(mock_coordinator, mock_config_entry):
-    """zone_clean before the map has loaded (helper returns []) dispatches nothing."""
+async def test_zone_clean_no_map_raises(mock_coordinator, mock_config_entry):
+    """zone_clean before the map has loaded (helper returns []) raises, not silent."""
     entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
     mock_coordinator.normalized_rects_to_quads_cm = MagicMock(return_value=[])
 
-    await entity.async_send_command(
-        "zone_clean", {"zones": [[0.1, 0.2, 0.3, 0.4]]}
-    )
+    with pytest.raises(HomeAssistantError, match="no map available yet"):
+        await entity.async_send_command(
+            "zone_clean", {"zones": [[0.1, 0.2, 0.3, 0.4]]}
+        )
 
     mock_coordinator.normalized_rects_to_quads_cm.assert_called_once()
     mock_coordinator.async_send_command.assert_not_called()
@@ -172,8 +175,8 @@ async def test_set_fan_speed(mock_coordinator, mock_config_entry):
     mock_build.assert_called_with("set_fan_speed", fan_speed=speed_max)
     mock_coordinator.async_send_command.assert_called_with({"cmd": "val"})
 
-    # Invalid speed
-    with pytest.raises(ValueError):
+    # Invalid speed: a user error, reported as such
+    with pytest.raises(ServiceValidationError):
         await entity.async_set_fan_speed("InvalidSpeed")
 
 
@@ -403,3 +406,173 @@ async def test_forget_map_active_raises(mock_coordinator, mock_config_entry):
         await entity.async_forget_map(11)
     mock_coordinator.async_forget_map.assert_not_called()
     mock_coordinator.async_send_command.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# set_nogo_zones — drawing restricted geometry on the map
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_forwards_rectangles(mock_coordinator, mock_config_entry):
+    """Normalized rectangles reach the coordinator, merged by default."""
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+
+    await entity.async_send_command(
+        "set_nogo_zones", {"forbidden": [[0.1, 0.2, 0.3, 0.4]]}
+    )
+
+    mock_coordinator.async_set_nogo_zones.assert_awaited_once_with(
+        add_forbidden=[[0.1, 0.2, 0.3, 0.4]], add_ban_mop=[], add_walls=[],
+        remove_forbidden=[], remove_ban_mop=[], remove_walls=[],
+        move_forbidden=[], move_ban_mop=[], move_walls=[],
+        expect_revision=None, replace=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_empty_without_replace_raises(
+    mock_coordinator, mock_config_entry
+):
+    """Sending nothing would WIPE the device's geometry, so it must be deliberate.
+
+    The underlying document replaces all restricted geometry at once, and the
+    device accepts it silently — so an accidental empty call is exactly the kind
+    of destructive no-op that must not be reachable by mistake.
+    """
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+
+    with pytest.raises(HomeAssistantError, match="replace: true"):
+        await entity.async_send_command("set_nogo_zones", {})
+
+    mock_coordinator.async_set_nogo_zones.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_explicit_clear_is_allowed(
+    mock_coordinator, mock_config_entry
+):
+    """`replace: true` with no rectangles is the documented way to clear."""
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+
+    await entity.async_send_command("set_nogo_zones", {"replace": True})
+
+    mock_coordinator.async_set_nogo_zones.assert_awaited_once_with(
+        add_forbidden=[], add_ban_mop=[], add_walls=[],
+        remove_forbidden=[], remove_ban_mop=[], remove_walls=[],
+        move_forbidden=[], move_ban_mop=[], move_walls=[],
+        expect_revision=None, replace=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_rejects_non_lists(mock_coordinator, mock_config_entry):
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+
+    with pytest.raises(HomeAssistantError, match="must be lists"):
+        await entity.async_send_command("set_nogo_zones", {"forbidden": "nope"})
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_forwards_virtual_walls(
+    mock_coordinator, mock_config_entry
+):
+    """A wall is a LINE — the same four numbers, but two endpoints, not a box."""
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+
+    await entity.async_send_command(
+        "set_nogo_zones", {"walls": [[0.1, 0.9, 0.8, 0.2]]}
+    )
+
+    mock_coordinator.async_set_nogo_zones.assert_awaited_once_with(
+        add_forbidden=[], add_ban_mop=[], add_walls=[[0.1, 0.9, 0.8, 0.2]],
+        remove_forbidden=[], remove_ban_mop=[], remove_walls=[],
+        move_forbidden=[], move_ban_mop=[], move_walls=[],
+        expect_revision=None, replace=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_removal_needs_no_new_shapes(
+    mock_coordinator, mock_config_entry
+):
+    """Deleting is a legitimate call on its own — no shapes to add, not a clear.
+
+    Without this the only way to remove a zone from the card would be
+    ``replace: true`` with the full survivor list, which round-trips every
+    surviving shape through normalized coordinates that clamp to the map image.
+    """
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+
+    await entity.async_send_command(
+        "set_nogo_zones", {"remove_forbidden": [1], "revision": 7}
+    )
+
+    mock_coordinator.async_set_nogo_zones.assert_awaited_once_with(
+        add_forbidden=[], add_ban_mop=[], add_walls=[],
+        remove_forbidden=[1], remove_ban_mop=[], remove_walls=[],
+        move_forbidden=[], move_ban_mop=[], move_walls=[],
+        expect_revision=7, replace=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_rejects_non_list_removals(
+    mock_coordinator, mock_config_entry
+):
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+
+    with pytest.raises(HomeAssistantError, match="must be lists of indices"):
+        await entity.async_send_command("set_nogo_zones", {"remove_walls": 2})
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_forwards_rotated_corner_points(
+    mock_coordinator, mock_config_entry
+):
+    """A zone given as four corners passes through untouched (rotation)."""
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+    diamond = [[0.5, 0.2], [0.8, 0.5], [0.5, 0.8], [0.2, 0.5]]
+
+    await entity.async_send_command("set_nogo_zones", {"forbidden": [diamond]})
+
+    assert mock_coordinator.async_set_nogo_zones.await_args.kwargs[
+        "add_forbidden"
+    ] == [diamond]
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_forwards_a_move(mock_coordinator, mock_config_entry):
+    """Moving an existing shape is a delta on an index, not a new outline."""
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+    move = {"index": 0, "dx": 25.0, "dy": -10.0, "rotate": 0.3}
+
+    await entity.async_send_command(
+        "set_nogo_zones", {"move_forbidden": [move], "revision": 4}
+    )
+
+    kwargs = mock_coordinator.async_set_nogo_zones.await_args.kwargs
+    assert kwargs["move_forbidden"] == [move]
+    assert kwargs["expect_revision"] == 4
+    # A move on its own is a change: it must not trip the "no shapes" guard.
+    assert kwargs["add_forbidden"] == []
+
+
+@pytest.mark.asyncio
+async def test_set_nogo_zones_rejects_non_list_moves(
+    mock_coordinator, mock_config_entry
+):
+    entity = RoboVacMQTTEntity(mock_coordinator, mock_config_entry)
+    mock_coordinator.async_set_nogo_zones = AsyncMock(return_value=True)
+
+    with pytest.raises(HomeAssistantError, match="index, dx, dy, rotate"):
+        await entity.async_send_command("set_nogo_zones", {"move_walls": {"index": 0}})

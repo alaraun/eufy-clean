@@ -230,6 +230,56 @@ def test_play_pause_tracked():
     assert "play_pause" in new_state.received_fields
 
 
+# ── Pause control (DPS 122) ────────────────────────────────────────
+
+
+def test_pause_control_outranks_a_running_work_status():
+    """DPS 15 keeps reading "Running" for a paused job; 122 is the truth."""
+    state = VacuumState()
+    new_state, _ = update_state_legacy(state, {"15": "Running", "122": "Pause"})
+
+    assert new_state.activity == "paused"
+
+
+def test_continue_resumes_a_job_the_pause_control_paused():
+    """...and it has to work in the other direction too.
+
+    Because 15 never leaves "Running", only 122 can undo what 122 did. Without
+    this the entity stayed Paused for the rest of a clean resumed from the eufy
+    app — nothing else was ever going to move it back.
+    """
+    paused, _ = update_state_legacy(VacuumState(), {"15": "Running", "122": "Pause"})
+    assert paused.activity == "paused"
+
+    resumed, changes = update_state_legacy(paused, {"122": "Continue"})
+    assert resumed.activity == "cleaning"
+    assert changes["activity"] == "cleaning"
+
+
+def test_nosweep_is_not_read_as_a_resume():
+    """The control's idle position is ambiguous — a stopped job sits there too."""
+    paused, _ = update_state_legacy(VacuumState(), {"15": "Running", "122": "Pause"})
+    unchanged, _ = update_state_legacy(paused, {"122": "Nosweep"})
+
+    assert unchanged.activity == "paused"
+
+
+def test_continue_does_not_override_a_work_status_in_the_same_frame():
+    """A frame that also docks the robot wins: docked is not "resumed"."""
+    paused, _ = update_state_legacy(VacuumState(), {"15": "Running", "122": "Pause"})
+    docked, _ = update_state_legacy(paused, {"15": "Charging", "122": "Continue"})
+
+    assert docked.activity == "docked"
+
+
+def test_continue_while_docked_changes_nothing():
+    """Only a PAUSED job resumes; the work status owns every other state."""
+    docked, _ = update_state_legacy(VacuumState(), {"15": "Charging"})
+    still_docked, _ = update_state_legacy(docked, {"122": "Continue"})
+
+    assert still_docked.activity == "docked"
+
+
 # ── Multiple DPS in one update ──────────────────────────────────────
 
 

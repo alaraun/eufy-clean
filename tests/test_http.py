@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 
-from custom_components.robovac_mqtt.api.http import _REQUEST_TIMEOUT, EufyHTTPClient
+from custom_components.robovac_mqtt.api.http import (
+    _REQUEST_TIMEOUT,
+    EufyHTTPClient,
+    EufyLoginTransientError,
+)
 
 
 def _mock_websession(mock_response: AsyncMock) -> MagicMock:
@@ -314,3 +319,110 @@ async def test_get_cloud_device_list_legacy_short_circuits():
 
     assert result == [{"id": "legacy_dev"}]
     assert mock_session.get.call_count == 1
+
+
+# --- transient vs rejected login ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500, 502, 503])
+async def test_login_transient_status_raises_transient(status):
+    """Rate limits and server errors are not a credential rejection."""
+    mock_session = _mock_websession_sequence(
+        _login_response(status), _login_response(status)
+    )
+    client = _make_client(websession=mock_session)
+
+    with pytest.raises(EufyLoginTransientError):
+        await client.login()
+
+
+@pytest.mark.asyncio
+async def test_login_transient_on_one_config_is_not_a_rejection():
+    """One config rate-limited and the other rejecting is still undecided."""
+    mock_session = _mock_websession_sequence(
+        _login_response(429), _login_response(401)
+    )
+    client = _make_client(websession=mock_session)
+
+    with pytest.raises(EufyLoginTransientError):
+        await client.login(validate_only=True)
+
+
+@pytest.mark.asyncio
+async def test_login_network_error_raises_transient():
+    """A transport failure on every config is transient."""
+    mock_session = MagicMock()
+    mock_session.post.side_effect = aiohttp.ClientConnectionError("reset")
+    client = _make_client(websession=mock_session)
+
+    with pytest.raises(EufyLoginTransientError):
+        await client.login()
+
+
+@pytest.mark.asyncio
+async def test_login_unreadable_200_raises_transient():
+    """A 200 whose body is not JSON cannot decide the credentials."""
+    bad = AsyncMock()
+    bad.status = 200
+    bad.json = AsyncMock(side_effect=ValueError("not json"))
+    mock_session = _mock_websession_sequence(bad, bad)
+    client = _make_client(websession=mock_session)
+
+    with pytest.raises(EufyLoginTransientError):
+        await client.login()
+
+
+@pytest.mark.asyncio
+async def test_login_success_after_transient_config_is_kept():
+    """A later config that yields a user_center wins over an undecided one."""
+    mock_session = _mock_websession_sequence(
+        _login_response(503), _login_response(200, "tok_v1")
+    )
+    client = _make_client(websession=mock_session)
+    client.get_user_info = AsyncMock(
+        return_value={"user_center_id": "x", "user_center_token": "t"}
+    )
+    client.get_mqtt_credentials = AsyncMock(return_value={"endpoint": "mqtt"})
+
+    result = await client.login()
+
+    assert result["session"]["access_token"] == "tok_v1"
+
+
+@pytest.mark.asyncio
+async def test_login_user_info_5xx_is_transient_not_fallback():
+    """A 5xx on user info must not demote the account to a fallback session."""
+    login_ok = _login_response(200, "tok")
+    user_5xx = AsyncMock()
+    user_5xx.status = 503
+    user_5xx.json = AsyncMock(return_value=None)
+
+    def _ctx(resp):
+        c = MagicMock()
+        c.__aenter__ = AsyncMock(return_value=resp)
+        c.__aexit__ = AsyncMock(return_value=False)
+        return c
+
+    mock_session = MagicMock()
+    mock_session.post.side_effect = [_ctx(login_ok), _ctx(login_ok)]
+    mock_session.get.side_effect = [_ctx(user_5xx), _ctx(user_5xx)]
+    client = _make_client(websession=mock_session)
+
+    with pytest.raises(EufyLoginTransientError):
+        await client.login()
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_without_user_center_logs_debug_only(caplog):
+    """A missing user_center is the expected fallback path, not an error."""
+    resp = AsyncMock()
+    resp.status = 200
+    resp.json = AsyncMock(return_value={"email": "a@example.com"})
+    client = _make_client(websession=_mock_websession(resp))
+    client.session = {"access_token": "tok"}
+
+    with caplog.at_level("DEBUG"):
+        assert await client.get_user_info() is None
+
+    assert not [r for r in caplog.records if r.levelname in ("ERROR", "WARNING")]

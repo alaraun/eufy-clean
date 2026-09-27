@@ -6,15 +6,22 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.robovac_mqtt.const import DOMAIN, DPS_MAP
 from custom_components.robovac_mqtt.models import VacuumState
 from custom_components.robovac_mqtt.switch import (
+    AutoUpdateSwitchEntity,
     ChildLockSwitchEntity,
     DockSwitchEntity,
     DoNotDisturbSwitchEntity,
     FindRobotSwitchEntity,
+)
+from custom_components.robovac_mqtt.switch import (
+    async_setup_entry as switch_setup_entry,
+)
+from custom_components.robovac_mqtt.switch import (
     set_collect_dust,
     set_wash_cfg,
 )
@@ -267,3 +274,37 @@ def test_dock_switch_unavailable_no_cfg(mock_coordinator):
     )
 
     assert entity.available is False
+
+
+async def test_auto_update_switch_raises_when_the_cloud_call_fails(mock_coordinator):
+    """async_set_auto_update reports failure by returning False; the toggle must fail."""
+    mock_coordinator.async_set_auto_update = AsyncMock(return_value=False)
+    entity = AutoUpdateSwitchEntity(mock_coordinator)
+
+    with pytest.raises(HomeAssistantError):
+        await entity.async_turn_on()
+    with pytest.raises(HomeAssistantError):
+        await entity.async_turn_off()
+
+
+@pytest.mark.parametrize("api_type", ["novel", "legacy"])
+async def test_auto_update_switch_needs_the_tuya_thing_client(
+    hass: HomeAssistant, mock_coordinator, api_type
+):
+    """Without a Tuya Thing client the firmware switch can do nothing, so none is made."""
+    mock_coordinator.api_type = api_type
+    entry = MockConfigEntry(domain=DOMAIN, data={}, entry_id="fw_entry")
+
+    hass.data[DOMAIN] = {entry.entry_id: {"coordinators": [mock_coordinator]}}
+
+    mock_coordinator.eufy_login.tuya_thing_client = None
+    add = MagicMock()
+    await switch_setup_entry(hass, entry, add)
+    assert not any(
+        isinstance(e, AutoUpdateSwitchEntity) for e in add.call_args[0][0]
+    )
+
+    mock_coordinator.eufy_login.tuya_thing_client = object()
+    add = MagicMock()
+    await switch_setup_entry(hass, entry, add)
+    assert any(isinstance(e, AutoUpdateSwitchEntity) for e in add.call_args[0][0])

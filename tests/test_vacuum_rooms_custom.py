@@ -137,3 +137,82 @@ async def test_room_clean_multi_room_config(mock_coordinator):
     second_call = call("room_clean", room_ids=[1, 2], map_id=1, mode="CUSTOMIZE")
 
     mock_coordinator.build_device_command.assert_has_calls([first_call, second_call])
+
+
+# ---------------------------------------------------------------------------
+# Legacy: customRooms is REPLACE-ALL, so neither call shape may build one
+# from the selection alone.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def legacy_coordinator(mock_coordinator):
+    """The same coordinator, speaking the legacy (Tuya DPS) protocol."""
+    mock_coordinator.api_type = "legacy"
+    mock_coordinator.async_set_room_configs = AsyncMock()
+    return mock_coordinator
+
+
+@pytest.mark.asyncio
+async def test_legacy_room_ids_with_globals_go_through_the_coordinator(
+    legacy_coordinator,
+):
+    """The bare-id shape must NOT build a partial customRooms document.
+
+    A legacy document naming only the selected rooms collapses every other
+    room's stored suction/water/repeat override — silently, because it applies
+    cleanly. The 'rooms' shape already routed around that; this one did not, so
+    ``room_clean`` with room_ids + fan_speed wiped the rest of the flat.
+    """
+    entity = RoboVacMQTTEntity(legacy_coordinator)
+
+    await entity.async_send_command(
+        "room_clean", params={"room_ids": [2], "fan_speed": "Max"}
+    )
+
+    # The settings went to the merge path, which resends every room that
+    # already carries an override...
+    legacy_coordinator.async_set_room_configs.assert_awaited_once_with(
+        {2: {"fan_speed": "Max"}}
+    )
+    # ...and nothing built a set_room_custom document straight from [2].
+    built = [c.args[0] for c in legacy_coordinator.build_device_command.call_args_list]
+    assert "set_room_custom" not in built
+    assert built == ["room_clean"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_room_ids_without_globals_still_just_cleans(legacy_coordinator):
+    """No per-room settings asked for -> no settings write at all."""
+    entity = RoboVacMQTTEntity(legacy_coordinator)
+
+    await entity.async_send_command("room_clean", params={"room_ids": [1, 2]})
+
+    legacy_coordinator.async_set_room_configs.assert_not_awaited()
+    legacy_coordinator.build_device_command.assert_called_once_with(
+        "room_clean", room_ids=[1, 2], map_id=1
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_room_ids_only_forward_fields_legacy_can_carry(
+    legacy_coordinator,
+):
+    """clean_mode / intensity / edge have no place in a legacy customRooms row."""
+    entity = RoboVacMQTTEntity(legacy_coordinator)
+
+    await entity.async_send_command(
+        "room_clean",
+        params={
+            "room_ids": [0],
+            "water_level": "High",
+            "clean_times": 2,
+            "clean_mode": "vacuum_mop",
+            "edge_mopping": True,
+        },
+    )
+
+    # Room id 0 is a real room on legacy — it must be a target like any other.
+    legacy_coordinator.async_set_room_configs.assert_awaited_once_with(
+        {0: {"water_level": "High", "clean_times": 2}}
+    )

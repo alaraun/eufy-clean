@@ -33,6 +33,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import EufyCleanCoordinator
+from .websocket_api import async_setup as async_setup_websocket_api
 
 PLATFORMS: list[Platform] = [
     Platform.VACUUM,
@@ -54,11 +55,17 @@ _FRONTEND_DIR = Path(__file__).parent / "frontend"
 # Also defines the pre-rename `zone-clean-card` alias for older dashboards.
 _CARD_FILENAME = "eufy-clean-card.js"
 _CARD_URL_PATH = f"/{DOMAIN}/{_CARD_FILENAME}"
+# Imported by the card, which resolves it relative to its own module URL, so it
+# must be served from the same URL directory.
+_RENDERER_FILENAME = "eufy-map-renderer.js"
+_RENDERER_URL_PATH = f"/{DOMAIN}/{_RENDERER_FILENAME}"
 
 
 def _card_cache_key(paths: list[Path], fallback: str) -> str:
-    """Short content hash over every frontend file, for the ``?v=`` cache-bust.
+    """Short content hash over EVERY frontend file, for the ``?v=`` cache-bust.
 
+    Hashes the whole bundle: the card propagates its own query string to the renderer
+    it imports, so a card-only hash would leave a renderer-only edit uncached-busted.
     Blocking file I/O — call via ``async_add_executor_job``.
     """
     digest = hashlib.sha256()
@@ -82,7 +89,7 @@ async def _async_register_frontend_card(hass: HomeAssistant) -> None:
     # the shipped file and pin stale content. Falls back to the version on error.
     card_version = await hass.async_add_executor_job(
         _card_cache_key,
-        [_FRONTEND_DIR / _CARD_FILENAME],
+        [_FRONTEND_DIR / _CARD_FILENAME, _FRONTEND_DIR / _RENDERER_FILENAME],
         integration.version,
     )
     card_url = f"{_CARD_URL_PATH}?v={card_version}"
@@ -95,6 +102,12 @@ async def _async_register_frontend_card(hass: HomeAssistant) -> None:
                 StaticPathConfig(
                     _CARD_URL_PATH,
                     str(_FRONTEND_DIR / _CARD_FILENAME),
+                    cache_headers=False,
+                ),
+                # Not in add_extra_js_url: the card imports it on demand.
+                StaticPathConfig(
+                    _RENDERER_URL_PATH,
+                    str(_FRONTEND_DIR / _RENDERER_FILENAME),
                     cache_headers=False,
                 ),
             ]
@@ -121,6 +134,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register the global, entry-independent parts once per HA run."""
     # Deferred: registering before `frontend` is up silently no-ops.
     async_when_setup(hass, "frontend", _register_card_when_frontend_ready)
+    # Websocket command names are global; registering one twice raises.
+    async_setup_websocket_api(hass)
     return True
 
 

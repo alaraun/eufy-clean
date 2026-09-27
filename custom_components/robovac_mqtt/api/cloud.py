@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 import aiohttp
@@ -10,11 +11,26 @@ import aiohttp
 from ..auth_store import session_expiry, trim_session, trim_user_info
 from ..const import DPS_MAP, EUFY_CLEAN_DEVICES, SCALAR_DPS, TUYA_PRODUCT_MODELS
 from ..utils import is_protobuf_dps_value
-from .http import EufyHTTPClient, EufyLoginTransientError
+from .errors import (
+    EufyLoginChallengeError,
+    EufyLoginError,
+    EufyLoginRateLimitedError,
+    EufyLoginTransientError,
+    EufySessionReplacedError,
+)
+from .http import EufyHTTPClient
+from .throttle import CloudThrottle
 from .tuya_cloud import TuyaCloudClient, TuyaCloudError
 from .tuya_thing import TuyaThingClient, is_session_error
 
-__all__ = ["EufyLogin", "EufyLoginError", "EufyLoginTransientError"]
+__all__ = [
+    "EufyLogin",
+    "EufyLoginChallengeError",
+    "EufyLoginError",
+    "EufyLoginRateLimitedError",
+    "EufyLoginTransientError",
+    "EufySessionReplacedError",
+]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,14 +61,6 @@ def _is_scalar_state_value(value: Any) -> bool:
     return False
 
 
-class EufyLoginError(Exception):
-    """The Eufy cloud rejected the credentials.
-
-    Transient failures (429, 5xx, network) raise EufyLoginTransientError, which
-    is not a subclass.
-    """
-
-
 class EufyLogin:
     def __init__(
         self,
@@ -62,7 +70,15 @@ class EufyLogin:
         websession: Any | None = None,
         auth_cache: Any | None = None,
     ):
-        self.eufyApi = EufyHTTPClient(username, password, openudid, websession=websession)
+        # The cache's dict is shared, so the budget and hold-offs persist with it.
+        self.throttle = CloudThrottle(
+            auth_cache.throttle if auth_cache is not None else None
+        )
+        if auth_cache is not None:
+            auth_cache.throttle = self.throttle.state
+        self.eufyApi = EufyHTTPClient(
+            username, password, openudid, websession=websession, throttle=self.throttle
+        )
         self.username = username
         self.password = password
         self.openudid = openudid
@@ -94,8 +110,17 @@ class EufyLogin:
         """Authenticate and discover devices, reusing a cached handshake.
 
         Validated by RESULT, not a timer: a cached run that finds nothing
-        discards the cache and re-logs in.
+        discards the cache and re-logs in, once and within the login budget.
+
+        Raises EufySessionReplacedError while another client's login has ended
+        the session (latched in the cache until a reauth or reconfigure), and
+        EufyLoginTransientError when the cached run failed on the server side.
         """
+        if self.auth_cache is not None and self.auth_cache.session_replaced_at:
+            raise EufySessionReplacedError(
+                "another client logged in with this Eufy account and ended the "
+                "session; not logging in again until reauthenticated"
+            )
         cached = self.auth_cache is not None and self.auth_cache.can_skip_login
         if cached:
             _LOGGER.debug("EufyLogin.init() starting: reusing cached credentials")
@@ -103,6 +128,17 @@ class EufyLogin:
             if self._eufy_session_proved():
                 self._capture_auth_cache()
                 return
+            if self.eufyApi.session_replaced:
+                self._latch_session_replaced()
+                raise EufySessionReplacedError(
+                    "another client logged in with this Eufy account and ended the "
+                    "session; not logging in again until reauthenticated"
+                )
+            if self.eufyApi.transient_error and not self.eufyApi.auth_error:
+                # A server error says nothing about the token: no login spent on it.
+                raise EufyLoginTransientError(
+                    "Eufy device lists unavailable (server error); keeping the cached session"
+                )
             _LOGGER.info(
                 "Cached Eufy credentials were rejected or found nothing; re-authenticating"
             )
@@ -112,6 +148,16 @@ class EufyLogin:
         await self.login({"mqtt": True})
         await self._discover()
         self._capture_auth_cache()
+
+    def _latch_session_replaced(self) -> None:
+        """Persistently refuse automatic logins until the user takes the session back."""
+        _LOGGER.warning(
+            "Another client logged in with this Eufy account and ended the session; "
+            "not logging in again until the entry is reauthenticated"
+        )
+        if self.auth_cache is not None:
+            self.auth_cache.clear_tokens()
+            self.auth_cache.session_replaced_at = time.time()
 
     def _eufy_session_proved(self) -> bool:
         """Did this run prove the cached EUFY token still works?

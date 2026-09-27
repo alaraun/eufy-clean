@@ -124,6 +124,10 @@ class AuthCache:
     session_expires_at: float | None = None
     user_info: dict[str, Any] | None = None
     mqtt_credentials: dict[str, Any] | None = None
+    # Login budget and hold-offs (api/throttle.py); outlives clear_tokens().
+    throttle: dict[str, Any] = field(default_factory=dict)
+    # When another client's login ended the session; set, no automatic login.
+    session_replaced_at: float | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> AuthCache:
@@ -149,9 +153,13 @@ class AuthCache:
             if isinstance(value, dict):
                 setattr(cache, name, value)
         cache.user_info = trim_user_info(cache.user_info)
-        expires_at = data.get("session_expires_at")
-        if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
-            cache.session_expires_at = float(expires_at)
+        for name in ("session_expires_at", "session_replaced_at"):
+            value = data.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                setattr(cache, name, float(value))
+        throttle = data.get("throttle")
+        if isinstance(throttle, dict):
+            cache.throttle = throttle
         return cache
 
     def to_dict(self) -> dict[str, Any]:
@@ -179,7 +187,8 @@ class AuthCache:
         return mqtt_credentials_fresh(self.mqtt_credentials)
 
     def clear_tokens(self) -> None:
-        """Drop the credentials but keep the identity and the probe memos.
+        """Drop the credentials but keep the identity, the probe memos, the
+        throttle state and the session-replaced latch.
 
         The openudid must survive: rotating it invalidates the account's tokens
         and re-registers the device.

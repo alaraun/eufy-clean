@@ -11,16 +11,20 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.setup import async_setup_component
 from packaging.requirements import Requirement
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.robovac_mqtt import async_remove_config_entry_device
 from custom_components.robovac_mqtt.api.cloud import (
+    EufyLoginChallengeError,
     EufyLoginError,
+    EufyLoginRateLimitedError,
     EufyLoginTransientError,
+    EufySessionReplacedError,
 )
-from custom_components.robovac_mqtt.auth_store import AuthStore
+from custom_components.robovac_mqtt.auth_store import AuthCache, AuthStore
 from custom_components.robovac_mqtt.const import DOMAIN
 
 _COMPONENT_DIR = Path(__file__).parent.parent / "custom_components" / "robovac_mqtt"
@@ -349,9 +353,11 @@ async def test_transient_login_failure_retries_and_keeps_tokens(hass: HomeAssist
     )
     entry.add_to_hass(hass)
 
-    with patch("custom_components.robovac_mqtt.EufyLogin") as mock_login_cls, patch.object(
-        AuthStore, "async_save", AsyncMock()
-    ) as mock_save:
+    await AuthStore(hass, entry.entry_id).async_save(
+        AuthCache(openudid="0123456789abcdef", session={"access_token": "kept"})
+    )
+
+    with patch("custom_components.robovac_mqtt.EufyLogin") as mock_login_cls:
         mock_login_cls.return_value.init = AsyncMock(
             side_effect=EufyLoginTransientError("HTTP 503")
         )
@@ -359,8 +365,8 @@ async def test_transient_login_failure_retries_and_keeps_tokens(hass: HomeAssist
         await hass.async_block_till_done()
 
     assert entry.state is ConfigEntryState.SETUP_RETRY
-    # the auth-failure path clears the tokens and saves; this one must not
-    mock_save.assert_not_awaited()
+    saved = await AuthStore(hass, entry.entry_id).async_load()
+    assert saved.session == {"access_token": "kept"}
 
 
 async def test_global_registration_runs_once_for_several_entries(hass: HomeAssistant):
@@ -456,3 +462,79 @@ def test_manifest_declares_every_runtime_import_within_ha_constraints():
     }
     for name in ("paho-mqtt", "protobuf"):
         assert reqs[name].specifier.contains(pins[name]), (name, pins[name])
+
+
+async def test_session_replaced_raises_reauth_and_a_repair_issue(hass: HomeAssistant):
+    """Another client's login: reauth (the user's decision), plus a repair issue."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_USERNAME: "user@example.com", CONF_PASSWORD: "pw"},
+        entry_id="replaced_entry",
+        title="user@example.com",
+    )
+    entry.add_to_hass(hass)
+
+    with patch("custom_components.robovac_mqtt.EufyLogin") as mock_login_cls:
+        mock_login_cls.return_value.init = AsyncMock(
+            side_effect=EufySessionReplacedError("kicked out")
+        )
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "session_replaced_replaced_entry")
+    assert any(
+        flow["context"]["source"] == "reauth"
+        for flow in hass.config_entries.flow.async_progress()
+    )
+
+
+async def test_rate_limit_retries_and_persists_the_hold_off(hass: HomeAssistant):
+    """A throttle keeps the tokens and persists the hold-off for the next retry."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_USERNAME: "user@example.com", CONF_PASSWORD: "pw"},
+        entry_id="throttled_entry",
+    )
+    entry.add_to_hass(hass)
+    await AuthStore(hass, entry.entry_id).async_save(
+        AuthCache(openudid="0123456789abcdef", session={"access_token": "kept"})
+    )
+
+    def _factory(*args, **kwargs):
+        cache = kwargs["auth_cache"]
+        instance = MagicMock()
+
+        async def _init():
+            cache.throttle["hold_off"] = {"login": 9e12}
+            raise EufyLoginRateLimitedError("100028", retry_after=7200, code=100028)
+
+        instance.init = AsyncMock(side_effect=_init)
+        return instance
+
+    with patch("custom_components.robovac_mqtt.EufyLogin", side_effect=_factory):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    saved = await AuthStore(hass, entry.entry_id).async_load()
+    assert saved.session == {"access_token": "kept"}
+    assert saved.throttle["hold_off"] == {"login": 9e12}
+
+
+async def test_login_challenge_asks_for_reauth(hass: HomeAssistant):
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_USERNAME: "user@example.com", CONF_PASSWORD: "pw"},
+        entry_id="challenge_entry",
+    )
+    entry.add_to_hass(hass)
+
+    with patch("custom_components.robovac_mqtt.EufyLogin") as mock_login_cls:
+        mock_login_cls.return_value.init = AsyncMock(
+            side_effect=EufyLoginChallengeError("captcha", code=100032)
+        )
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_ERROR

@@ -11,7 +11,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from custom_components.robovac_mqtt.api.cloud import EufyLogin
+from custom_components.robovac_mqtt.api.cloud import (
+    EufyLogin,
+    EufyLoginTransientError,
+    EufySessionReplacedError,
+)
 from custom_components.robovac_mqtt.api.http import _LOGIN_CONFIGS, EufyHTTPClient
 from custom_components.robovac_mqtt.api.tuya_cloud import TuyaCloudError
 from custom_components.robovac_mqtt.auth_store import (
@@ -711,3 +715,78 @@ async def test_stale_cache_actually_clears_the_cached_tokens():
     assert seen.get("after_reset") is None, "tokens were not cleared before re-login"
     assert cache.openudid == "stable", "identity must survive a token reset"
     assert cache.session != {"access_token": original_token}
+
+
+# ---------------------------------------------------------------------------
+# Session-replaced latch and throttle persistence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_kicked_out_cached_session_latches_and_does_not_log_in():
+    """26084 on the cached run: no login, the latch is set, the tokens dropped."""
+    cache = _usable_cache()
+    login = _login_with_cache(cache)
+
+    async def discover():
+        login.eufyApi.auth_error = True
+        login.eufyApi.session_replaced = True
+
+    login.getDevices.side_effect = discover
+
+    with pytest.raises(EufySessionReplacedError):
+        await login.init()
+
+    login.login.assert_not_awaited()
+    assert cache.session_replaced_at is not None
+    assert cache.session is None
+
+
+@pytest.mark.asyncio
+async def test_a_latched_cache_refuses_before_any_request():
+    cache = _usable_cache()
+    cache.session_replaced_at = time.time()
+    login = _login_with_cache(cache)
+
+    with pytest.raises(EufySessionReplacedError):
+        await login.init()
+
+    login.getDevices.assert_not_awaited()
+    login.login.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_server_error_on_the_cached_run_spends_no_login():
+    """5xx on the device lists is transient: the cached session is kept."""
+    cache = _usable_cache()
+    login = _login_with_cache(cache)
+
+    async def discover():
+        login.eufyApi.transient_error = True
+
+    login.getDevices.side_effect = discover
+
+    with pytest.raises(EufyLoginTransientError):
+        await login.init()
+
+    login.login.assert_not_awaited()
+    assert cache.session == {"access_token": "t", "user_id": "uid"}
+
+
+def test_throttle_and_latch_survive_clear_tokens_and_round_trip():
+    cache = _usable_cache()
+    cache.throttle = {"logins": [1.0], "hold_off": {"login": 2.0}}
+    cache.session_replaced_at = 3.0
+    cache.clear_tokens()
+
+    again = AuthCache.from_dict(cache.to_dict())
+    assert again.throttle == {"logins": [1.0], "hold_off": {"login": 2.0}}
+    assert again.session_replaced_at == 3.0
+    assert again.session is None
+
+
+def test_the_login_throttle_state_lives_in_the_cache():
+    cache = AuthCache()
+    login = EufyLogin("u", "p", "udid", websession=MagicMock(), auth_cache=cache)
+    login.throttle.note_login()
+    assert len(cache.throttle["logins"]) == 1

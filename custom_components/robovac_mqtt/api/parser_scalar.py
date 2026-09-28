@@ -1,16 +1,11 @@
-"""Inbound DPS parsing for scalar (Tuya-style) protocol devices.
-
-Scalar devices (e.g. T2210/G50) send plain ints and JSON instead of the
-X-series protobuf blobs, on a different set of DPS numbers, and emit NO
-WorkStatus (DPS 153). api/parser.update_state dispatches here when
-state.api_type == "scalar". See docs/g50_capture/FINDINGS.md for the
-captured DPS schema.
-"""
+"""Inbound DPS parsing for scalar (Tuya-style) devices: plain ints and JSON on
+their own DPS numbers, with no WorkStatus (DPS 153)."""
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import replace
 from typing import Any
 
@@ -20,6 +15,7 @@ from ..const import (
     SCALAR_CLEAN_PATTERN_NAMES,
     SCALAR_DPS,
     SCALAR_STATE_NAMES,
+    WEEKDAY_ABBREVIATIONS,
 )
 from ..models import VacuumState, track_received_field
 
@@ -33,14 +29,9 @@ _SCALAR_ACCESSORY_FIELDS = {
     "sensors": "sensor_usage",
 }
 
+# DPS 151 keys weekdays "1".."7" (Mon..Sun).
 _SCALAR_SCHEDULE_DAYS = {
-    "1": "Mon",
-    "2": "Tue",
-    "3": "Wed",
-    "4": "Thu",
-    "5": "Fri",
-    "6": "Sat",
-    "7": "Sun",
+    str(i + 1): day for i, day in enumerate(WEEKDAY_ABBREVIATIONS)
 }
 
 
@@ -58,10 +49,7 @@ def _g_int(value: Any) -> int | None:
 def process_scalar_dps(
     state: VacuumState, dps: dict[str, Any], changes: dict[str, Any]
 ) -> None:
-    """Process DPS for scalar/JSON devices (e.g. T2210/G50).
-
-    Each DPS is handled independently so one bad value never aborts the batch.
-    """
+    """Process scalar DPS; each key is handled alone so one bad value isn't fatal."""
     for key, value in dps.items():
         try:
             if key == SCALAR_DPS["STATE"]:
@@ -162,16 +150,17 @@ def process_scalar_dps(
                 _process_scalar_accessories(state, value, changes)
 
             else:
-                _LOGGER.debug("scalar-protocol unhandled DPS %s: %s", key, value)
+                _LOGGER.debug(
+                    "scalar-protocol unhandled DPS %s (%s)", key, type(value).__name__
+                )
 
         except Exception as e:
             _LOGGER.warning(
                 "Error parsing scalar-protocol DPS %s: %s", key, e, exc_info=True
             )
 
-    # DPS 122 is a motion flag (1=stationary, 0=moving). A stationary robot that
-    # is otherwise mid-clean is paused — reconcile after the loop so it doesn't
-    # matter whether 122 or 15 was processed first.
+    # DPS 122 = motion flag (1=stationary, 0=moving); stationary mid-clean means
+    # paused. Reconciled after the loop so DPS order doesn't matter.
     pause_flag = dps.get(SCALAR_DPS["PAUSE"])
     if pause_flag is not None:
         activity = changes.get("activity", state.activity)
@@ -194,7 +183,7 @@ def _map_scalar_task_status(code: int) -> str:
 
 
 def _parse_scalar_schedules(value: Any) -> list[dict[str, Any]] | None:
-    """Decode the DPS 151 schedule JSON into friendly read-only entries.
+    """Decode DPS 151 schedule JSON into read-only entries.
 
     Raw entry: {"e":bool, "t":"HHMM", "r":"<day digits 1=Mon..7=Sun>",
                 "s":suction 0-3, "f":pattern 1/2, "id":int}.
@@ -224,6 +213,89 @@ def _parse_scalar_schedules(value: Any) -> list[dict[str, Any]] | None:
     return out
 
 
+def encode_scalar_repeat(days: list[str] | str | None) -> str:
+    """Encode human day names / list into a Scalar repeat string (1=Mon..7=Sun)."""
+    if not days:
+        return ""
+    if isinstance(days, str):
+        raw_items = [days]
+    else:
+        raw_items = list(days)
+
+    parts: list[str] = []
+    for item in raw_items:
+        if not item:
+            continue
+        item_str = str(item).strip()
+        if item_str.isdigit() and set(item_str) <= set("1234567"):
+            return "".join(sorted(set(item_str)))
+        if item_str.lower() in ("every day", "everyday", "daily", "all", "*"):
+            return "1234567"
+        if item_str.lower() in ("once", "never", "none"):
+            return ""
+        for p in re.split(r"[,|\s]+", item_str):
+            if p.strip():
+                parts.append(p.strip().lower())
+
+    day_map = {
+        "mon": "1", "monday": "1",
+        "tue": "2", "tues": "2", "tuesday": "2",
+        "wed": "3", "wednesday": "3",
+        "thu": "4", "thur": "4", "thurs": "4", "thursday": "4",  # codespell:ignore thur
+        "fri": "5", "friday": "5",
+        "sat": "6", "saturday": "6",
+        "sun": "7", "sunday": "7",
+    }
+    digits = set()
+    for part in parts:
+        if part in ("every day", "everyday", "daily", "all", "*"):
+            return "1234567"
+        if part in ("weekdays", "weekday"):
+            digits.update({"1", "2", "3", "4", "5"})
+        elif part in ("weekends", "weekend"):
+            digits.update({"6", "7"})
+        elif part in day_map:
+            digits.add(day_map[part])
+    return "".join(sorted(digits))
+
+
+def build_scalar_schedule_payload(raw_entries: list[dict[str, Any]]) -> str:
+    """Build DPS 151 schedule JSON string from raw schedule entries."""
+    return json.dumps({"l": raw_entries}, separators=(",", ":"))
+
+
+def scalar_suction_to_int(suction: str | int | None) -> int:
+    """Convert human suction string or int to scalar suction int (0-3)."""
+    if isinstance(suction, int) and 0 <= suction <= 3:
+        return suction
+    s_map = {"quiet": 0, "standard": 1, "turbo": 2, "max": 3}
+    return s_map.get(str(suction or "").strip().lower(), 1)
+
+
+def scalar_pattern_to_int(pattern: str | int | None) -> int:
+    """Convert human pattern string or int to scalar clean pattern int (1=Arranged, 2=Random)."""
+    if isinstance(pattern, int) and pattern in (1, 2):
+        return pattern
+    p_map = {"arranged": 1, "random": 2}
+    return p_map.get(str(pattern or "").strip().lower(), 1)
+
+
+def schedule_entry_to_scalar_raw(entry: dict[str, Any]) -> dict[str, Any]:
+    """Convert parsed schedule entry dict back into raw scalar DPS 151 dict."""
+    t_str = str(entry.get("time", "")).replace(":", "")
+    r_str = encode_scalar_repeat(entry.get("days", ""))
+    s_int = scalar_suction_to_int(entry.get("suction"))
+    f_int = scalar_pattern_to_int(entry.get("pattern"))
+    return {
+        "id": entry.get("id"),
+        "e": 1 if entry.get("enabled", True) else 0,
+        "t": t_str,
+        "r": r_str,
+        "s": s_int,
+        "f": f_int,
+    }
+
+
 def _process_scalar_dnd(
     state: VacuumState, value: Any, changes: dict[str, Any]
 ) -> None:
@@ -245,10 +317,9 @@ def _process_scalar_dnd(
 def _process_scalar_accessories(
     state: VacuumState, value: Any, changes: dict[str, Any]
 ) -> None:
-    """Parse scalar-protocol accessory usage-counter JSON (DPS 150) into AccessoryState.
+    """Parse accessory usage JSON (DPS 150) into AccessoryState.
 
-    Stores raw usage counters; conversion to % remaining happens in the sensor
-    layer (per-accessory max life). See docs/g50_capture/FINDINGS.md.
+    Stores raw counters; the sensor layer converts them to % remaining.
     """
     data = value if isinstance(value, dict) else json.loads(value)
     accessory_changes = {

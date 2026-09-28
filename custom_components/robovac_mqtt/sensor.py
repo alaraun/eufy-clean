@@ -21,25 +21,15 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from ._orphan_cleanup import prune_orphan_entities
-from .const import (
-    ACCESSORY_MAX_LIFE,
-    DOMAIN,
-    SCALAR_ACCESSORY_MAX_LIFE,
-)
+from .const import API_TYPE_LEGACY, API_TYPE_NOVEL, API_TYPE_SCALAR, DOMAIN
 from .coordinator import EufyCleanCoordinator, VacuumState
-from .entity import API_TYPE_NOVEL, API_TYPE_SCALAR, filter_supported_entities
+from .entity import filter_supported_entities
+from .profiles import AccessorySpec, DeviceProfile, get_device_profile
 
 _LOGGER = logging.getLogger(__name__)
 
 
 PARALLEL_UPDATES = 0
-
-
-def _active_rooms_available(state: VacuumState) -> bool:
-    """Return whether the active cleaning target sensor has meaningful data."""
-    return bool(
-        state.active_room_names or state.current_scene_name or state.active_zone_count
-    )
 
 
 def _active_rooms_value(state: VacuumState) -> str:
@@ -69,9 +59,7 @@ async def async_setup_entry(
         _LOGGER.debug("Adding sensors for %s", coordinator.device_name)
 
         sensors: list[SensorEntity] = [
-            # Battery sensor
             BatterySensorEntity(coordinator),
-            # Error Message Sensor
             RoboVacSensor(
                 coordinator,
                 "error_message",
@@ -83,7 +71,6 @@ async def async_setup_entry(
                 icon="mdi:alert-circle-outline",
                 category=EntityCategory.DIAGNOSTIC,
             ),
-            # Task Status Sensor
             RoboVacSensor(
                 coordinator,
                 "task_status",
@@ -95,8 +82,6 @@ async def async_setup_entry(
                 icon="mdi:robot-vacuum",
                 category=EntityCategory.DIAGNOSTIC,
             ),
-            # Work Mode Sensor (novel WorkStatus mode; scalar G50 has no
-            # equivalent)
             RoboVacSensor(
                 coordinator,
                 "work_mode",
@@ -111,15 +96,9 @@ async def async_setup_entry(
             ),
         ]
 
-        # Novel/scalar sensors: these rely on DPS keys (154, 165, 167, 168,
-        # 173, ...) that legacy (plain Tuya Cloud) devices don't support, so
-        # they are skipped entirely for legacy devices. Per-protocol gating
-        # (scalar vs novel) is handled by filter_supported_entities via each
-        # sensor's supported_api_types. The "active_map" sensor additionally
-        # requires the MQTT/P2P transport (Tuya Cloud / local-Tuya don't carry
-        # MultiMapsManageResponse) and is appended separately below.
-        novel_sensors: list[SensorEntity] = [
-            # Cleaning Time Sensor
+        # Every protocol reports cleaning stats, and each sensor stays hidden by its
+        # availability_fn until a value arrives, so offer them for all api types.
+        stats_sensors: list[SensorEntity] = [
             RoboVacSensor(
                 coordinator,
                 "cleaning_time",
@@ -134,8 +113,7 @@ async def async_setup_entry(
                 suggested_unit_of_measurement="min",
                 suggested_display_precision=0,
             ),
-            # Cleaning Area Sensor (verified: scalar DPS 110 = m²,
-            # 4=43ft²/3=32ft²; X-series via cleaning stats).
+            # Reported in m² on every protocol.
             RoboVacSensor(
                 coordinator,
                 "cleaning_area",
@@ -148,7 +126,6 @@ async def async_setup_entry(
                 availability_fn=lambda s: "cleaning_stats" in s.received_fields,
                 suggested_display_precision=0,
             ),
-            # Total Cleaning Area
             RoboVacSensor(
                 coordinator,
                 "total_cleaning_area",
@@ -161,7 +138,6 @@ async def async_setup_entry(
                 availability_fn=lambda s: "cleaning_totals" in s.received_fields,
                 suggested_display_precision=0,
             ),
-            # Total Cleaning Time
             RoboVacSensor(
                 coordinator,
                 "total_cleaning_time",
@@ -175,7 +151,12 @@ async def async_setup_entry(
                 suggested_unit_of_measurement="h",
                 suggested_display_precision=1,
             ),
-            # Total Cleaning Count
+        ]
+
+        # These rely on DPS keys (154, 165, 167, 168, 173, ...) that legacy Tuya
+        # Cloud devices don't have; scalar-vs-novel gating is left to each sensor's
+        # supported_api_types.
+        novel_sensors: list[SensorEntity] = [
             RoboVacSensor(
                 coordinator,
                 "total_cleaning_count",
@@ -187,9 +168,7 @@ async def async_setup_entry(
                 icon="mdi:counter",
                 availability_fn=lambda s: "cleaning_totals" in s.received_fields,
             ),
-            # Station / map sensors — scalar (Tuya) vacuum-only devices like
-            # the G50 have no station and no maps.
-            # Water level sensor (Station Clean Water)
+            # Station / map sensors — scalar vacuum-only devices have neither.
             RoboVacSensor(
                 coordinator,
                 "water_level",
@@ -201,7 +180,6 @@ async def async_setup_entry(
                 availability_fn=lambda s: "station_clean_water" in s.received_fields,
                 supported_api_types=(API_TYPE_NOVEL,),
             ),
-            # Dock status sensor
             RoboVacSensor(
                 coordinator,
                 "dock_status",
@@ -214,7 +192,6 @@ async def async_setup_entry(
                 availability_fn=lambda s: "dock_status" in s.received_fields,
                 supported_api_types=(API_TYPE_NOVEL,),
             ),
-            # Active cleaning target sensor
             RoboVacSensor(
                 coordinator,
                 "active_cleaning_target",
@@ -233,9 +210,7 @@ async def async_setup_entry(
                 },
                 supported_api_types=(API_TYPE_NOVEL,),
             ),
-            # WiFi + robot-position diagnostics come from novel-only DPS
-            # (169/176/179); scalar (Tuya) devices never report them.
-            # WiFi Signal Strength (from DPS 176 UnisettingResponse)
+            # WiFi + robot-position diagnostics come from novel-only DPS 169/176/179.
             RoboVacSensor(
                 coordinator,
                 "wifi_signal",
@@ -250,7 +225,6 @@ async def async_setup_entry(
                 enabled_default=False,
                 supported_api_types=(API_TYPE_NOVEL,),
             ),
-            # WiFi SSID (from DPS 169 DeviceInfo)
             RoboVacSensor(
                 coordinator,
                 "wifi_ssid",
@@ -262,7 +236,6 @@ async def async_setup_entry(
                 enabled_default=False,
                 supported_api_types=(API_TYPE_NOVEL,),
             ),
-            # WiFi IP Address (from DPS 169 DeviceInfo)
             RoboVacSensor(
                 coordinator,
                 "wifi_ip",
@@ -274,7 +247,6 @@ async def async_setup_entry(
                 enabled_default=False,
                 supported_api_types=(API_TYPE_NOVEL,),
             ),
-            # Dock firmware version (from DPS 169 DeviceInfo.station.software)
             RoboVacSensor(
                 coordinator,
                 "dock_firmware_version",
@@ -285,7 +257,6 @@ async def async_setup_entry(
                 availability_fn=lambda s: "dock_firmware_version" in s.received_fields,
                 supported_api_types=(API_TYPE_NOVEL,),
             ),
-            # Robot Position - raw (from DPS 179 telemetry, diagnostic)
             RoboVacSensor(
                 coordinator,
                 "robot_position_x",
@@ -310,103 +281,67 @@ async def async_setup_entry(
                 enabled_default=False,
                 supported_api_types=(API_TYPE_NOVEL,),
             ),
-            # Schedules (read-only; scalar/Tuya devices, DPS 151). State =
-            # entry count; the decoded entries are exposed as attributes.
-            RoboVacSensor(
-                coordinator,
-                "schedules",
-                "Schedules",
-                lambda s: len(s.schedules),
-                device_class=None,
-                unit=None,
-                state_class=None,
-                icon="mdi:calendar-clock",
-                category=EntityCategory.DIAGNOSTIC,
-                availability_fn=lambda s: "schedules" in s.received_fields,
-                extra_state_attributes_fn=lambda s: {"entries": s.schedules},
-                supported_api_types=(API_TYPE_SCALAR,),
-            ),
         ]
 
-        # Accessory Sensors. Filter/brushes/sensor are universal; cleaning tray
-        # and mopping cloth only exist on mop-capable (novel) devices.
-        accessories = [
-            ("filter_usage", "Filter Remaining", "mdi:air-filter", None),
-            ("main_brush_usage", "Rolling Brush Remaining", "mdi:broom", None),
-            ("side_brush_usage", "Side Brush Remaining", "mdi:broom", None),
-            ("sensor_usage", "Sensor Remaining", "mdi:eye-outline", None),
-            (
-                "scrape_usage",
-                "Cleaning Tray Remaining",
-                "mdi:wiper",
-                (API_TYPE_NOVEL,),
-            ),
-            ("mop_usage", "Mopping Cloth Remaining", "mdi:water", (API_TYPE_NOVEL,)),
-        ]
-
-        for attr, name, icon, supported_api_types in accessories:
-            # We must capture the specific attr value in the lambda default args
-            # otherwise all lambdas will point to the last attr in the loop.
-            # X-series report usage in hours; scalar-protocol (scalar protocol) report
-            # usage in MINUTES with their own per-accessory max life (hours).
+        profile = (
+            coordinator.profile
+            if isinstance(getattr(coordinator, "profile", None), DeviceProfile)
+            else get_device_profile(
+                getattr(coordinator, "device_model", ""),
+                getattr(coordinator, "api_type", API_TYPE_NOVEL),
+            )
+        )
+        for spec in profile.accessories.values():
             def get_accessory_remaining(
-                state: VacuumState, a: str = attr
+                state: VacuumState, s: AccessorySpec = spec
             ) -> int | None:
-                usage = getattr(state.accessories, a) or 0
-                if state.api_type == "scalar":
-                    max_h = SCALAR_ACCESSORY_MAX_LIFE.get(a)
-                    if not max_h:
-                        return None  # accessory not present on this device
-                    return max(0, round(max_h - usage / 60))
-                max_life = ACCESSORY_MAX_LIFE.get(a, 0)
-                # Ensure we don't go negative if usage exceeds defaults
-                return max(0, max_life - usage)
+                usage = getattr(state.accessories, s.attr_name) or 0
+                used_h = usage / 60 if s.time_unit == "m" else usage
+                return max(0, round(s.max_life_hours - used_h))
 
-            # Extra attributes explicitly using specific attr
-            def get_attributes(state: VacuumState, a: str = attr) -> dict[str, Any]:
-                usage = getattr(state.accessories, a) or 0
-                if state.api_type == "scalar":
-                    max_h = SCALAR_ACCESSORY_MAX_LIFE.get(a, 0)
-                    used_h = usage / 60
-                    pct = max(0, round(100 * (1 - used_h / max_h))) if max_h else None
-                    return {
-                        "usage_hours": round(used_h, 1),
-                        "total_life_hours": max_h,
-                        "percent_remaining": pct,
-                    }
-                return {
-                    "usage_hours": usage,
-                    "total_life_hours": ACCESSORY_MAX_LIFE.get(a, 0),
+            def get_attributes(
+                state: VacuumState, s: AccessorySpec = spec
+            ) -> dict[str, Any]:
+                usage = getattr(state.accessories, s.attr_name) or 0
+                used_h = usage / 60 if s.time_unit == "m" else usage
+                pct = (
+                    max(0, round(100 * (1 - used_h / s.max_life_hours)))
+                    if s.max_life_hours > 0
+                    else 0
+                )
+                attrs: dict[str, Any] = {
+                    "usage_hours": round(used_h, 1) if s.time_unit == "m" else usage,
+                    "total_life_hours": s.max_life_hours,
+                    "percent_remaining": pct,
                 }
+                if s.is_maintenance:
+                    attrs["is_maintenance"] = True
+                return attrs
 
-            def accessory_available(state: VacuumState, a: str = attr) -> bool:
-                if "accessories" not in state.received_fields:
-                    return False
-                if state.api_type == "scalar":
-                    # Hide accessories the scalar-protocol device doesn't have (mop, tray)
-                    return a in SCALAR_ACCESSORY_MAX_LIFE
-                return True
+            def accessory_available(
+                state: VacuumState, s: AccessorySpec = spec
+            ) -> bool:
+                return "accessories" in state.received_fields
 
-            novel_sensors.append(
+            stats_sensors.append(
                 RoboVacSensor(
                     coordinator,
-                    attr.replace("_usage", "_remaining"),
-                    name,
+                    spec.sensor_id,
+                    spec.sensor_name,
                     get_accessory_remaining,
                     device_class=SensorDeviceClass.DURATION,
-                    unit="h",  # Hours
+                    unit="h",
                     state_class=SensorStateClass.MEASUREMENT,
-                    icon=icon,
+                    icon=spec.icon,
                     category=EntityCategory.DIAGNOSTIC,
                     extra_state_attributes_fn=get_attributes,
                     availability_fn=accessory_available,
-                    supported_api_types=supported_api_types,
+                    supported_api_types=spec.supported_api_types,
                 )
             )
 
-        # Active map ID sensor — only populated by the MQTT/P2P transport.
-        # Tuya Cloud / local-Tuya don't carry MultiMapsManageResponse so the
-        # ID never arrives; skip the entity to avoid permanent `unavailable`.
+        # Only the MQTT transport carries MultiMapsManageResponse; on Tuya the id
+        # never arrives, so skip the entity rather than leave it `unavailable`.
         if coordinator.connection_type == "mqtt":
             novel_sensors.append(
                 RoboVacSensor(
@@ -424,18 +359,32 @@ async def async_setup_entry(
                 )
             )
 
-        # Legacy (plain Tuya Cloud) devices only support the universal sensors;
-        # the novel/scalar DPS keys those sensors rely on are unavailable, so
-        # only merge them for non-legacy devices.
-        if coordinator.api_type != "legacy":
+        sensors += stats_sensors
+        if coordinator.api_type != API_TYPE_LEGACY:
             sensors += novel_sensors
 
-        # Apply protocol gating (scalar vs novel) before adding entities.
         entities.extend(filter_supported_entities(coordinator, sensors))
 
-    # Prune registry orphans (e.g., active_map entity registered by an old
-    # build but no longer created on the Tuya transport, or novel sensors no
-    # longer created for legacy devices).
+        # State = entry count, entries in attributes. Gated explicitly because
+        # "legacy" reads as "novel" in the supported_api_types filter.
+        if coordinator.api_type in (API_TYPE_SCALAR, API_TYPE_LEGACY):
+            entities.append(
+                RoboVacSensor(
+                    coordinator,
+                    "schedules",
+                    "Schedules",
+                    lambda s: len(s.schedules),
+                    device_class=None,
+                    unit=None,
+                    state_class=None,
+                    icon="mdi:calendar-clock",
+                    category=EntityCategory.DIAGNOSTIC,
+                    availability_fn=lambda s: "schedules" in s.received_fields,
+                    extra_state_attributes_fn=lambda s: {"entries": s.schedules},
+                )
+            )
+
+    # Drop entities an older build registered that this device no longer creates.
     prune_orphan_entities(
         hass,
         config_entry.entry_id,
@@ -479,10 +428,8 @@ class RoboVacSensor(CoordinatorEntity[EufyCleanCoordinator], SensorEntity):
         self._availability_fn = availability_fn
         self._attr_unique_id = f"{coordinator.device_id}_{id_suffix}"
 
-        # Use Home Assistant standard naming
-        # This will prefix the device name to the entity name if the
-        # device name is not in the entity name
-        # Result: sensor.robovac_water_level (Safer, avoids collisions)
+        # HA prefixes the device name to the entity id, which avoids collisions
+        # between devices.
         self._attr_has_entity_name = True
         self._attr_name = name_suffix
         self._attr_entity_registry_enabled_default = enabled_default
@@ -502,10 +449,7 @@ class RoboVacSensor(CoordinatorEntity[EufyCleanCoordinator], SensorEntity):
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available.
-
-        Checks coordinator availability and optional custom availability function.
-        """
+        """Return True if the coordinator and the optional availability_fn agree."""
         if not super().available:
             return False
         if self._availability_fn is not None:
@@ -528,9 +472,8 @@ class RoboVacSensor(CoordinatorEntity[EufyCleanCoordinator], SensorEntity):
 class BatterySensorEntity(CoordinatorEntity[EufyCleanCoordinator], SensorEntity):
     """Dedicated battery sensor entity for Matter Bridge compatibility.
 
-    Matter Bridges require devices that operate on battery power to explicitly
-    expose a dedicated battery sensor entity (device_class=battery) rather than
-    just exposing the battery level as a state attribute on the Vacuum entity.
+    A Matter Bridge needs a real device_class=battery entity; the battery level as
+    an attribute on the vacuum entity is not enough.
     """
 
     _attr_has_entity_name = True
